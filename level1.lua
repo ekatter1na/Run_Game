@@ -1,0 +1,715 @@
+local composer = require("composer")
+local scene = composer.newScene()
+local physics = require("physics")
+
+local json = require("json")
+local soundManager = require("soundManager")
+
+local player
+local ground, ceiling
+local obstacles = {}
+local finish
+local goodStars = {}
+local badStars = {}
+local score = 0
+local scoreText = nil
+
+local isDead = false
+local transitioning = false
+local levelCompleted = false
+local winScreenGroup = nil
+local gameLoop = nil
+local collisionHandler = nil
+local deathTimer = nil
+local jumpsLeft = 2
+
+-- АНИМАЦИОННЫЕ ПЕРЕМЕННЫЕ
+local runFrames = {}
+local jumpFrames = {}
+local currentAnimation = nil
+local animationTimer = nil
+local currentFrameIndex = 1
+
+local left = display.screenOriginX
+local top = display.screenOriginY
+local right = left + display.viewableContentWidth
+local bottom = top + display.viewableContentHeight
+
+local W = display.viewableContentWidth
+local H = display.viewableContentHeight
+local CX = display.contentCenterX
+local CY = display.contentCenterY
+
+local SPEED = 6
+
+
+-- Прогресс
+local progress = { unlockedLevel = 1 }
+
+local function loadProgress()
+    local path = system.pathForFile("save.json", system.DocumentsDirectory)
+    local file = io.open(path, "r")
+    if file then
+        local contents = file:read("*a")
+        local data = json.decode(contents)
+        if data then progress = data end
+        file:close()
+    end
+end
+
+local function saveProgress()
+    local path = system.pathForFile("save.json", system.DocumentsDirectory)
+    local file = io.open(path, "w")
+    if file then
+        file:write(json.encode(progress))
+        file:close()
+    end
+end
+
+-- ЗАГРУЗКА И ОТОБРАЖЕНИЕ КАДРОВ АНИМАЦИИ
+local function hideAllFrames()
+    for i = 1, #runFrames do
+        if runFrames[i] then runFrames[i].isVisible = false end
+    end
+    for i = 1, #jumpFrames do
+        if jumpFrames[i] then jumpFrames[i].isVisible = false end
+    end
+end
+
+local function showCurrentFrame()
+    hideAllFrames()
+    
+    if currentAnimation == "run" then
+        if runFrames[currentFrameIndex] then
+            runFrames[currentFrameIndex].isVisible = true
+            runFrames[currentFrameIndex].x = player.x
+            runFrames[currentFrameIndex].y = player.y
+        end
+    elseif currentAnimation == "jump" then
+        if jumpFrames[currentFrameIndex] then
+            jumpFrames[currentFrameIndex].isVisible = true
+            jumpFrames[currentFrameIndex].x = player.x
+            jumpFrames[currentFrameIndex].y = player.y
+        end
+    end
+end
+
+local function updateAnimation()
+    if isDead or levelCompleted then return end
+    
+    currentFrameIndex = currentFrameIndex + 1
+    
+    if currentAnimation == "run" then
+        if currentFrameIndex > #runFrames then
+            currentFrameIndex = 1
+        end
+    elseif currentAnimation == "jump" then
+        if currentFrameIndex > #jumpFrames then
+            currentFrameIndex = #jumpFrames
+        end
+    end
+    
+    showCurrentFrame()
+end
+
+local function startRunAnimation()
+    if animationTimer then
+        timer.cancel(animationTimer)
+        animationTimer = nil
+    end
+    
+    currentAnimation = "run"
+    currentFrameIndex = 1
+    hideAllFrames()
+    showCurrentFrame()
+    
+    animationTimer = timer.performWithDelay(70, updateAnimation, 0)
+end
+
+local function startJumpAnimation()
+    if animationTimer then
+        timer.cancel(animationTimer)
+        animationTimer = nil
+    end
+    
+    currentAnimation = "jump"
+    currentFrameIndex = 1
+    hideAllFrames()
+    showCurrentFrame()
+    
+    animationTimer = timer.performWithDelay(110, updateAnimation, 0)
+    
+    timer.performWithDelay(500, function()
+        if not isDead and not levelCompleted and currentAnimation == "jump" then
+            startRunAnimation()
+        end
+    end)
+end
+
+local function loadAnimations()
+    -- Загружаем кадры бега 
+    for i = 0, 9 do
+        local frame
+        if i < 10 then
+            frame = display.newImageRect("images/pers/Run__00" .. i .. ".png", 60, 60)
+        else
+            frame = display.newImageRect("images/pers/Run__0" .. i .. ".png", 60, 60)
+        end
+        frame.isVisible = false
+        table.insert(runFrames, frame)
+        scene.view:insert(frame)
+    end
+    
+    -- Загружаем кадры прыжка 
+    for i = 0, 9 do
+        local frame
+        if i < 10 then
+            frame = display.newImageRect("images/pers/Jump__00" .. i .. ".png", 60, 60)
+        else
+            frame = display.newImageRect("images/pers/Jump__0" .. i .. ".png", 60, 60)
+        end
+        frame.isVisible = false
+        table.insert(jumpFrames, frame)
+        scene.view:insert(frame)
+    end
+    
+    print("Загружено кадров: бег - " .. #runFrames .. ", прыжок - " .. #jumpFrames)
+    return #runFrames > 0
+end
+
+-- СОЗДАНИЕ ЗВЁЗД
+local function createGoodStar(x, y)
+    local star = display.newImageRect(scene.view, "images/coin.png", 16, 16)
+    star.x = x
+    star.y = y
+    physics.addBody(star, "kinematic")
+    star.isSensor = true
+    star.myName = "goodStar"
+    table.insert(goodStars, star)
+end
+
+local function createBadStar(x, y)
+    local star = display.newImageRect(scene.view, "images/anticoin.png", 16, 16)
+    star.x = x
+    star.y = y
+    physics.addBody(star, "kinematic")
+    star.isSensor = true
+    star.myName = "badStar"
+    table.insert(badStars, star)
+end
+
+-- ЭКРАН ПОБЕДЫ
+local function showWinScreen()
+    if levelCompleted then return end
+    levelCompleted = true
+    isDead = true
+    transitioning = true
+    
+    if deathTimer then
+        timer.cancel(deathTimer)
+        deathTimer = nil
+    end
+    
+    if animationTimer then
+        timer.cancel(animationTimer)
+        animationTimer = nil
+    end
+    
+    soundManager.playSound("level_complete")
+    
+    local sceneGroup = scene.view
+    
+    winScreenGroup = display.newGroup()
+    sceneGroup:insert(winScreenGroup)
+    
+    local overlay = display.newRect(winScreenGroup, CX, CY, W, H)
+    overlay:setFillColor(0, 0, 0, 0.7)
+    
+    local winBox = display.newRoundedRect(winScreenGroup, CX, CY, 300, 280, 15)
+    winBox:setFillColor(0.12, 0.12, 0.2)
+    winBox.strokeWidth = 2
+    winBox:setStrokeColor(0.5, 0.5, 0.6)
+    
+    local winText = display.newText(winScreenGroup, "УРОВЕНЬ ПРОЙДЕН!", CX, CY - 85, native.systemFontBold, 22)
+    winText:setFillColor(0.7, 0.9, 0.5)
+    
+    local finalScoreText = display.newText(winScreenGroup, "ОЧКИ: " .. score, CX, CY - 40, native.systemFontBold, 18)
+    finalScoreText:setFillColor(1, 1, 0.5)
+    
+    local menuBtn = display.newRoundedRect(winScreenGroup, CX, CY + 15, 160, 35, 8)
+    menuBtn:setFillColor(0.35, 0.2, 0.2)
+    menuBtn:setStrokeColor(0.5, 0.5, 0.6)
+    menuBtn.strokeWidth = 1
+    local menuLabel = display.newText(winScreenGroup, "МЕНЮ", CX, CY + 15, native.systemFont, 18)
+    menuLabel:setFillColor(0.9, 0.8, 0.8)
+    
+    local restartBtn = display.newRoundedRect(winScreenGroup, CX, CY + 60, 160, 35, 8)
+    restartBtn:setFillColor(0.25, 0.35, 0.25)
+    restartBtn:setStrokeColor(0.5, 0.5, 0.6)
+    restartBtn.strokeWidth = 1
+    local restartLabel = display.newText(winScreenGroup, "РЕСТАРТ", CX, CY + 60, native.systemFont, 18)
+    restartLabel:setFillColor(0.8, 0.9, 0.8)
+    
+    local nextBtn = display.newRoundedRect(winScreenGroup, CX, CY + 105, 160, 35, 8)
+    nextBtn:setFillColor(0.25, 0.35, 0.5)
+    nextBtn:setStrokeColor(0.5, 0.5, 0.6)
+    nextBtn.strokeWidth = 1
+    local nextLabel = display.newText(winScreenGroup, "СЛЕДУЮЩИЙ", CX, CY + 105, native.systemFont, 18)
+    nextLabel:setFillColor(0.8, 0.9, 0.9)
+    
+    menuBtn:addEventListener("tap", function()
+        composer.removeScene("level1")
+        composer.gotoScene("start", { effect = "fade", time = 200 })
+    end)
+    
+    restartBtn:addEventListener("tap", function()
+        composer.removeScene("level1")
+        composer.gotoScene("level1", { effect = "fade", time = 200 })
+    end)
+    
+    nextBtn:addEventListener("tap", function()
+        composer.removeScene("level1")
+        composer.gotoScene("level2", { effect = "slideLeft", time = 300 })
+    end)
+end
+
+-- ПРЫЖОК
+local function jump()
+    if isDead or levelCompleted then return end
+    if jumpsLeft <= 0 then return end
+    
+    player:setLinearVelocity(0, -450)
+    soundManager.playSound("jump")
+    startJumpAnimation()
+    jumpsLeft = jumpsLeft - 1
+end
+
+-- ВЫХОД В МЕНЮ
+local function exitToMenu()
+    if transitioning or levelCompleted or isDead then return end
+    transitioning = true
+    isDead = true
+    
+    if deathTimer then
+        timer.cancel(deathTimer)
+        deathTimer = nil
+    end
+    
+    if animationTimer then
+        timer.cancel(animationTimer)
+        animationTimer = nil
+    end
+    
+    composer.removeScene("level1")
+    composer.gotoScene("start", { effect = "fade", time = 200 })
+end
+
+-- РЕСТАРТ ПРИ СМЕРТИ
+local function restartLevel()
+    if deathTimer then deathTimer = nil end
+    if animationTimer then
+        timer.cancel(animationTimer)
+        animationTimer = nil
+    end
+    composer.removeScene("level1")
+    composer.gotoScene("level1", { effect = "fade", time = 200 })
+end
+
+-- ПРЕПЯТСТВИЯ 
+local function createObstacle(x)
+    local spike = display.newImageRect(scene.view, "images/spike.png", 40, 40)
+    spike.x = x
+    spike.y = ground.y - 32
+    physics.addBody(spike, "kinematic")
+    spike.isSensor = true
+    table.insert(obstacles, spike)
+end
+
+-- СОЗДАНИЕ СЦЕНЫ
+function scene:create(event)
+    local sceneGroup = self.view
+    
+    isDead = false
+    transitioning = false
+    levelCompleted = false
+    score = 0
+    
+    if deathTimer then
+        timer.cancel(deathTimer)
+        deathTimer = nil
+    end
+    
+    if animationTimer then
+        timer.cancel(animationTimer)
+        animationTimer = nil
+    end
+    
+    if gameLoop then Runtime:removeEventListener("enterFrame", gameLoop) end
+    if collisionHandler then Runtime:removeEventListener("collision", collisionHandler) end
+    
+    for i = #obstacles, 1, -1 do
+        if obstacles[i] and obstacles[i].removeSelf then
+            obstacles[i]:removeSelf()
+        end
+        obstacles[i] = nil
+    end
+    obstacles = {}
+    
+    for i = #goodStars, 1, -1 do
+        if goodStars[i] and goodStars[i].removeSelf then
+            goodStars[i]:removeSelf()
+        end
+        goodStars[i] = nil
+    end
+    goodStars = {}
+    
+    for i = #badStars, 1, -1 do
+        if badStars[i] and badStars[i].removeSelf then
+            badStars[i]:removeSelf()
+        end
+        badStars[i] = nil
+    end
+    badStars = {}
+    
+    for i = #runFrames, 1, -1 do
+        if runFrames[i] then
+            runFrames[i]:removeSelf()
+            runFrames[i] = nil
+        end
+    end
+    runFrames = {}
+    
+    for i = #jumpFrames, 1, -1 do
+        if jumpFrames[i] then
+            jumpFrames[i]:removeSelf()
+            jumpFrames[i] = nil
+        end
+    end
+    jumpFrames = {}
+    
+    if winScreenGroup then
+        winScreenGroup:removeSelf()
+        winScreenGroup = nil
+    end
+
+    physics.start()
+    physics.setGravity(0, 28)
+    
+    soundManager.playBackground()
+
+    -- ФОН
+    local bg = display.newRect(sceneGroup, CX, CY, W, H)
+    bg:setFillColor(0.1, 0.1, 0.2)
+    bg:toBack()
+
+    -- ЗЕМЛЯ
+    for i = 0, math.ceil(W / 100) + 2 do
+        local tile = display.newImageRect(sceneGroup, "images/ground.png", 100, 30)
+        tile.anchorX = 0
+        tile.x = i * 100
+        tile.y = bottom - 10
+    end
+    
+    ground = display.newRect(sceneGroup, CX, bottom - 10, W + 1000, 30)
+    ground:setFillColor(0.2, 0.7, 0.2)
+    ground.alpha = 0
+    physics.addBody(ground, "static", { bounce = 0, friction = 1 })
+    ground.myName = "ground"
+
+    -- ПОТОЛОК
+    for i = 0, math.ceil(W / 100) + 2 do
+        local tile = display.newImageRect(sceneGroup, "images/ground.png", 100, 30)
+        tile:setFillColor(0.5, 0.5, 0.5)
+        tile.anchorX = 0
+        tile.x = i * 100
+        tile.y = top + 10
+    end
+    
+    ceiling = display.newRect(sceneGroup, CX, top + 10, W + 1000, 30)
+    ceiling:setFillColor(0.2, 0.7, 0.2)
+    ceiling.alpha = 0
+    physics.addBody(ceiling, "static", { bounce = 0, friction = 1 })
+    ceiling.myName = "ceiling"
+
+    -- ИГРОК
+    player = display.newRect(sceneGroup, CX - 180, CY, 35, 35)
+    player:setFillColor(0, 0.8, 1)
+    player.alpha = 0  -- делаем коллайдер невидимым
+    physics.addBody(player, "dynamic", { bounce = 0, friction = 1 })
+    player.isFixedRotation = true
+    player.myName = "player"
+
+    -- ЗАГРУЗКА АНИМАЦИЙ
+    local animLoaded = loadAnimations()
+    
+    if animLoaded then
+        startRunAnimation()
+    else
+        print("Анимации не загружены")
+    end
+
+    -- ПРЕПЯТСТВИЯ (шипы)
+    local startX = 1000
+    for i = 1, 6 do
+        createObstacle(startX + i * 700)
+    end
+
+    -- ЗВЁЗДЫ
+      createGoodStar(750, ground.y - 55)  
+    createGoodStar(1350, ground.y - 55) 
+    createGoodStar(2050, ground.y - 50)  
+    createGoodStar(2750, ground.y - 45)  
+    createGoodStar(3450, ground.y - 50)  
+    createGoodStar(4150, ground.y - 55)  
+    createGoodStar(4800, ground.y - 45)  
+    
+    createBadStar(1180, ground.y - 25)   
+    createBadStar(1850, ground.y - 50)     
+    createBadStar(3250, ground.y - 55)    
+    createBadStar(4550, ground.y - 45)   
+
+    -- ФИНИШ
+    finish = display.newImageRect(sceneGroup, "images/finish.png", 50, H)
+    finish.x = startX + 6 * 700 + 300
+    finish.y = CY
+    physics.addBody(finish, "static", { isSensor = true })
+    finish.myName = "finish"
+
+    finish.collision = function(self, event)
+        if event.phase ~= "began" then return end
+        if event.other ~= player then return end
+        if transitioning then return end
+        if levelCompleted then return end
+
+        transitioning = true
+
+        loadProgress()
+        if progress.unlockedLevel < 2 then
+            progress.unlockedLevel = 2
+            saveProgress()
+        end
+
+        showWinScreen()
+    end
+    finish:addEventListener("collision")
+
+    -- ТЕКСТ СЧЁТА
+    scoreText = display.newText({
+        parent = sceneGroup,
+        text = "ОЧКИ: 0",
+        x = right - 80,
+        y = top + 35,
+        font = native.systemFontBold,
+        fontSize = 18
+    })
+    scoreText:setFillColor(1, 1, 0.5)
+
+    -- КНОПКИ
+    local uiGroup = display.newGroup()
+    sceneGroup:insert(uiGroup)
+
+    local jumpBtn = display.newCircle(uiGroup, right - 60, bottom - 60, 28)
+    jumpBtn:setFillColor(0.5, 0.4, 0.2, 0.85)
+    jumpBtn:setStrokeColor(0.6, 0.6, 0.6)
+    jumpBtn.strokeWidth = 1
+    local jumpText = display.newText(uiGroup, "↑", right - 60, bottom - 60, native.systemFontBold, 22)
+    jumpText:setFillColor(0.9, 0.9, 0.7)
+    jumpBtn:addEventListener("tap", jump)
+
+    local menuBtn = display.newRect(uiGroup, left + 60, top + 35, 70, 35)
+    menuBtn:setFillColor(0.4, 0.2, 0.2, 0.85)
+    menuBtn:setStrokeColor(0.6, 0.6, 0.6)
+    menuBtn.strokeWidth = 1
+    local menuText = display.newText(uiGroup, "МЕНЮ", left + 60, top + 35 + 2, native.systemFontBold, 16)
+    menuText:setFillColor(0.9, 0.8, 0.8)
+    menuBtn:addEventListener("tap", exitToMenu)
+
+    -- НАДПИСЬ УРОВНЯ
+    local levelText = display.newText({
+        parent = sceneGroup,
+        text = "УРОВЕНЬ 1",
+        x = right - 70,
+        y = top + 65,
+        font = native.systemFontBold,
+        fontSize = 16
+    })
+    levelText:setFillColor(0.8, 0.8, 0.6)
+
+    -- ОБРАБОТЧИК СТОЛКНОВЕНИЙ
+collisionHandler = function(event)
+    if isDead or levelCompleted then return end
+
+    if event.phase == "began" then
+        local a, b = event.object1, event.object2
+        local other = (a == player) and b or a
+
+        if not other then return end
+
+        -- ПРОВЕРКА НА ЗЕМЛЮ (восстанавливаем прыжок)
+        if other == ground then
+            jumpsLeft = 2
+        end
+
+        if other.myName == "goodStar" then
+            score = score + 1
+            if scoreText then scoreText.text = "ОЧКИ: " .. score end
+            if other.removeSelf then other:removeSelf() end
+            return
+        end
+        
+        if other.myName == "badStar" then
+            if score > 0 then
+                score = score - 1
+            end
+            if scoreText then scoreText.text = "ОЧКИ: " .. score end
+            if other.removeSelf then other:removeSelf() end
+            return
+        end
+
+        if other and other ~= ground and other ~= ceiling and other ~= finish then
+            isDead = true
+            soundManager.playDeath()
+            deathTimer = timer.performWithDelay(800, restartLevel)
+        end
+    end
+end
+    Runtime:addEventListener("collision", collisionHandler)
+
+    -- ДВИЖЕНИЕ МИРА
+    gameLoop = function()
+        if isDead or levelCompleted then return end
+
+        -- Обновляем позиции анимированных кадров
+        if currentAnimation == "run" and runFrames[currentFrameIndex] then
+            runFrames[currentFrameIndex].x = player.x
+            runFrames[currentFrameIndex].y = player.y
+        elseif currentAnimation == "jump" and jumpFrames[currentFrameIndex] then
+            jumpFrames[currentFrameIndex].x = player.x
+            jumpFrames[currentFrameIndex].y = player.y
+        end
+
+        for i = #obstacles, 1, -1 do
+            local o = obstacles[i]
+            if o and o.x then
+                o.x = o.x - SPEED
+                if o.x + 50 < left then
+                    if o.removeSelf then o:removeSelf() end
+                    table.remove(obstacles, i)
+                end
+            end
+        end
+        
+        for i = #goodStars, 1, -1 do
+            local s = goodStars[i]
+            if s and s.x then
+                s.x = s.x - SPEED
+                if s.x + 50 < left then
+                    if s.removeSelf then s:removeSelf() end
+                    table.remove(goodStars, i)
+                end
+            end
+        end
+        
+        for i = #badStars, 1, -1 do
+            local s = badStars[i]
+            if s and s.x then
+                s.x = s.x - SPEED
+                if s.x + 50 < left then
+                    if s.removeSelf then s:removeSelf() end
+                    table.remove(badStars, i)
+                end
+            end
+        end
+
+        if finish and finish.x then
+            finish.x = finish.x - SPEED
+        end
+    end
+    Runtime:addEventListener("enterFrame", gameLoop)
+end
+
+-- HIDE
+function scene:hide(event)
+    if event.phase == "will" then
+        if gameLoop then Runtime:removeEventListener("enterFrame", gameLoop) end
+        if collisionHandler then Runtime:removeEventListener("collision", collisionHandler) end
+        if deathTimer then
+            timer.cancel(deathTimer)
+            deathTimer = nil
+        end
+        if animationTimer then
+            timer.cancel(animationTimer)
+            animationTimer = nil
+        end
+    end
+end
+
+-- DESTROY
+function scene:destroy(event)
+    if gameLoop then Runtime:removeEventListener("enterFrame", gameLoop) end
+    if collisionHandler then Runtime:removeEventListener("collision", collisionHandler) end
+    if deathTimer then
+        timer.cancel(deathTimer)
+        deathTimer = nil
+    end
+    if animationTimer then
+        timer.cancel(animationTimer)
+        animationTimer = nil
+    end
+    
+    if obstacles then
+        for i = #obstacles, 1, -1 do
+            if obstacles[i] and obstacles[i].removeSelf then
+                obstacles[i]:removeSelf()
+            end
+        end
+    end
+    obstacles = {}
+    
+    if goodStars then
+        for i = #goodStars, 1, -1 do
+            if goodStars[i] and goodStars[i].removeSelf then
+                goodStars[i]:removeSelf()
+            end
+        end
+    end
+    goodStars = {}
+    
+    if badStars then
+        for i = #badStars, 1, -1 do
+            if badStars[i] and badStars[i].removeSelf then
+                badStars[i]:removeSelf()
+            end
+        end
+    end
+    badStars = {}
+    
+    for i = #runFrames, 1, -1 do
+        if runFrames[i] then
+            runFrames[i]:removeSelf()
+            runFrames[i] = nil
+        end
+    end
+    runFrames = {}
+    
+    for i = #jumpFrames, 1, -1 do
+        if jumpFrames[i] then
+            jumpFrames[i]:removeSelf()
+            jumpFrames[i] = nil
+        end
+    end
+    jumpFrames = {}
+    
+    if winScreenGroup then
+        winScreenGroup:removeSelf()
+        winScreenGroup = nil
+    end
+    
+    physics.stop()
+end
+
+scene:addEventListener("create", scene)
+scene:addEventListener("hide", scene)
+scene:addEventListener("destroy", scene)
+
+return scene
